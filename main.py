@@ -4,6 +4,7 @@ import urllib.request, urllib.parse, urllib.error
 from datetime import datetime, timedelta
 from base64 import b64encode, b64decode
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from html import escape
 
 # ----------------- Config (set via Pella env vars) -----------------
 LICENSE_BOT_TOKEN = os.environ.get("LICENSE_BOT_TOKEN", "")
@@ -128,6 +129,16 @@ class LicenseStore:
             self._persist()
             return entry, "disabled"
 
+    def update_note(self, key, note):
+        with self.lock:
+            entry = self.data["licenses"].get(key)
+            if not entry:
+                return None, "License not found"
+            entry["note"] = note or ""
+            self.data["licenses"][key] = entry
+            self._persist()
+            return entry, "updated"
+
     def list_keys(self, status=None):
         with self.lock:
             out = []
@@ -180,6 +191,7 @@ class TelegramAdminBot:
         self.running = False
         self.thread = None
         self.offset = 0
+        self.sessions = {}
 
     def start(self):
         if self.running or not self.token or not self.admin_ids:
@@ -212,8 +224,91 @@ class TelegramAdminBot:
         except Exception:
             return None
 
-    def _send(self, chat_id, text):
-        self._tg_post("sendMessage", {"chat_id": chat_id, "text": text})
+    def _send(self, chat_id, text, buttons=None, parse_mode="HTML"):
+        params = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+            params["disable_web_page_preview"] = "true"
+        if buttons:
+            params["reply_markup"] = json.dumps({"inline_keyboard": buttons})
+        self._tg_post("sendMessage", params)
+
+    def _answer_callback(self, callback_id, text=""):
+        if not callback_id:
+            return
+        payload = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text
+        self._tg_post("answerCallbackQuery", payload)
+
+    def _menu_buttons(self):
+        return [
+            [{"text": "New key", "callback_data": "newkey"}, {"text": "Renew key", "callback_data": "renewkey"}],
+            [{"text": "Disable key", "callback_data": "disablekey"}, {"text": "Key info", "callback_data": "keyinfo"}],
+            [{"text": "List keys", "callback_data": "listkeys"}, {"text": "Help", "callback_data": "help"}],
+        ]
+
+    def _plan_keyboard(self, action):
+        return [
+            [{"text": "1d", "callback_data": f"plan:{action}:1d"}, {"text": "1w", "callback_data": f"plan:{action}:1w"}, {"text": "1m", "callback_data": f"plan:{action}:1m"}],
+            [{"text": "3m", "callback_data": f"plan:{action}:3m"}, {"text": "6m", "callback_data": f"plan:{action}:6m"}, {"text": "1y", "callback_data": f"plan:{action}:1y"}],
+            [{"text": "life", "callback_data": f"plan:{action}:life"}, {"text": "custom days", "callback_data": f"plan:{action}:custom"}],
+            [{"text": "Main menu", "callback_data": "menu"}],
+        ]
+
+    def _list_keyboard(self):
+        return [
+            [{"text": "Active", "callback_data": "list:active"}, {"text": "Expired", "callback_data": "list:expired"}, {"text": "Disabled", "callback_data": "list:disabled"}],
+            [{"text": "All", "callback_data": "list:all"}, {"text": "Main menu", "callback_data": "menu"}],
+        ]
+
+    def _send_menu(self, chat_id):
+        self._send(chat_id, "<b>License admin</b>\nChoose an action below or keep using the slash commands.", buttons=self._menu_buttons())
+
+    def _format_license(self, entry):
+        devices = ", ".join(entry.get("devices") or []) or "Unbound"
+        return (
+            f"<b>Key</b>: <code>{escape(entry.get('key',''))}</code>\n"
+            f"Plan: {escape(entry.get('plan',''))}\n"
+            f"Status: {escape(entry.get('status',''))}\n"
+            f"Start: {escape(entry.get('start',''))}\n"
+            f"Expiry: {escape(entry.get('expiry',''))}\n"
+            f"Devices: {escape(devices)}\n"
+            f"Note: {escape(entry.get('note',''))}"
+        )
+
+    def _short_license(self, entry):
+        return f"{escape(entry.get('key',''))} | {escape(entry.get('plan',''))} | {escape(entry.get('status',''))} | exp {escape(entry.get('expiry',''))}"
+
+    def _clear_session(self, chat_id):
+        if chat_id in self.sessions:
+            del self.sessions[chat_id]
+
+    def _send_license_created(self, chat_id, entry):
+        text = (
+            "<b>New key created</b>\n"
+            f"<code>{escape(entry['key'])}</code>\n"
+            f"Plan: {escape(entry['plan'])}\n"
+            f"Expiry: {escape(entry['expiry'])}"
+        )
+        buttons = [
+            [{"text": "Add note", "callback_data": f"addnote:{entry['key']}"}],
+            [{"text": "Create another", "callback_data": "newkey"}, {"text": "Main menu", "callback_data": "menu"}],
+        ]
+        self._send(chat_id, text, buttons=buttons)
+
+    def _send_list(self, chat_id, status=None):
+        items = self.store.list_keys(status=status if status != "all" else None)
+        if not items:
+            self._send(chat_id, "No keys for this filter.", buttons=self._list_keyboard())
+            return
+        preview = items[:20]
+        label = status or "all"
+        lines = [f"{i+1}. {self._short_license(entry)}" for i, entry in enumerate(preview)]
+        if len(items) > len(preview):
+            lines.append(f"... {len(items) - len(preview)} more not shown")
+        body = "<b>Keys</b> (" + escape(label) + ")\n" + "\n".join(lines)
+        self._send(chat_id, body, buttons=self._list_keyboard())
 
     def _loop(self):
         while self.running:
@@ -223,11 +318,81 @@ class TelegramAdminBot:
                 continue
             for u in upd.get("result", []):
                 self.offset = max(self.offset, u.get("update_id", 0))
+                cb = u.get("callback_query")
+                if cb:
+                    self._handle_callback(cb)
+                    continue
                 msg = u.get("message") or u.get("edited_message")
                 if msg:
-                    self._handle(msg)
+                    self._handle_message(msg)
 
-    def _handle(self, message):
+    def _handle_callback(self, cb):
+        chat_id = cb.get("message", {}).get("chat", {}).get("id")
+        user_id = cb.get("from", {}).get("id")
+        data = cb.get("data") or ""
+        callback_id = cb.get("id")
+        if not chat_id or not user_id:
+            return
+        if user_id not in self.admin_ids:
+            self._answer_callback(callback_id, "Unauthorized")
+            return
+        self._answer_callback(callback_id)
+        if data == "menu":
+            self._clear_session(chat_id)
+            self._send_menu(chat_id)
+        elif data == "newkey":
+            self._clear_session(chat_id)
+            self._send(chat_id, "Pick a plan for the new key:", buttons=self._plan_keyboard("new"))
+        elif data.startswith("plan:new:"):
+            plan = data.split(":", 2)[2]
+            if plan == "custom":
+                self.sessions[chat_id] = {"mode": "new_custom_days"}
+                self._send(chat_id, "Send the number of days for this custom key.")
+                return
+            entry = self.store.create_license(plan)
+            self._clear_session(chat_id)
+            self._send_license_created(chat_id, entry)
+        elif data == "renewkey":
+            self.sessions[chat_id] = {"mode": "renew_key"}
+            self._send(chat_id, "Send the key you want to renew.")
+        elif data.startswith("plan:renew:"):
+            plan = data.split(":", 2)[2]
+            ctx = self.sessions.get(chat_id) or {}
+            key = ctx.get("key")
+            if not key:
+                self._send(chat_id, "Send the key first.")
+                return
+            if plan == "custom":
+                self.sessions[chat_id] = {"mode": "renew_custom_days", "key": key}
+                self._send(chat_id, "Send the number of days to extend.")
+                return
+            entry, msg = self.store.renew_license(key, plan, None)
+            self._clear_session(chat_id)
+            if not entry:
+                self._send(chat_id, msg or "Renew failed.", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+            else:
+                self._send(chat_id, f"Renewed <code>{escape(key)}</code>\nPlan: {escape(entry['plan'])}\nExpiry: {escape(entry['expiry'])}", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+        elif data == "disablekey":
+            self.sessions[chat_id] = {"mode": "disable_key"}
+            self._send(chat_id, "Send the key to disable.")
+        elif data == "keyinfo":
+            self.sessions[chat_id] = {"mode": "info_key"}
+            self._send(chat_id, "Send the key to inspect.")
+        elif data == "listkeys":
+            self._send_list(chat_id, status=None)
+        elif data.startswith("list:"):
+            status = data.split(":", 1)[1] or None
+            self._send_list(chat_id, status=status if status != "all" else None)
+        elif data.startswith("addnote:"):
+            key = data.split(":", 1)[1]
+            self.sessions[chat_id] = {"mode": "add_note", "key": key}
+            self._send(chat_id, f"Send note text for {escape(key)} (or type '-' to clear).")
+        elif data == "help":
+            self._send_help(chat_id)
+        else:
+            self._send(chat_id, "Unknown action.", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+
+    def _handle_message(self, message):
         chat_id = message.get("chat", {}).get("id")
         user_id = message.get("from", {}).get("id")
         text = (message.get("text") or "").strip()
@@ -236,30 +401,91 @@ class TelegramAdminBot:
         if user_id not in self.admin_ids:
             self._send(chat_id, "Unauthorized.")
             return
+        # Session-driven flows (buttons or prompts)
+        session = self.sessions.get(chat_id)
+        if session:
+            mode = session.get("mode")
+            if mode == "new_custom_days":
+                try:
+                    days = int(text)
+                    entry = self.store.create_license("custom", custom_days=days)
+                    self._clear_session(chat_id)
+                    self._send_license_created(chat_id, entry)
+                except Exception:
+                    self._send(chat_id, "Send a number of days (e.g. 45).")
+                return
+            if mode == "renew_key":
+                key = text.split()[0]
+                self.sessions[chat_id] = {"mode": "renew_plan", "key": key}
+                self._send(chat_id, f"Renew <code>{escape(key)}</code>. Pick a plan:", buttons=self._plan_keyboard("renew"))
+                return
+            if mode == "renew_custom_days":
+                key = session.get("key")
+                try:
+                    days = int(text)
+                    entry, msg = self.store.renew_license(key, "custom", days)
+                    self._clear_session(chat_id)
+                    if not entry:
+                        self._send(chat_id, msg or "Renew failed.", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+                    else:
+                        self._send(chat_id, f"Renewed <code>{escape(key)}</code>\nPlan: {escape(entry['plan'])}\nExpiry: {escape(entry['expiry'])}", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+                except Exception:
+                    self._send(chat_id, "Send a number of days (e.g. 30).")
+                return
+            if mode == "disable_key":
+                entry, msg = self.store.disable_license(text)
+                self._clear_session(chat_id)
+                if not entry:
+                    self._send(chat_id, msg or "Disable failed.", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+                else:
+                    self._send(chat_id, f"Disabled <code>{escape(text)}</code>", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+                return
+            if mode == "info_key":
+                entry = self.store.get_info(text)
+                self._clear_session(chat_id)
+                if not entry:
+                    self._send(chat_id, "Not found.", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+                else:
+                    self._send(chat_id, self._format_license(entry), buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+                return
+            if mode == "add_note":
+                key = session.get("key")
+                note = "" if text.strip() == "-" else text.strip()
+                entry, msg = self.store.update_note(key, note)
+                self._clear_session(chat_id)
+                if not entry:
+                    self._send(chat_id, msg or "Note update failed.", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+                else:
+                    self._send(chat_id, f"Updated note for <code>{escape(key)}</code>.", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
+                return
+        # Command handling
         parts = text.split()
         cmd = parts[0].split("@")[0].lower()
         args = parts[1:]
-        if cmd == "/newkey":
+        if cmd in ("/start", "/menu"):
+            self._clear_session(chat_id)
+            self._send_menu(chat_id)
+        elif cmd == "/newkey":
             if not args:
                 self._send(chat_id, "Usage: /newkey <plan> [days] [note]")
                 return
             plan = args[0]; custom_days = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
             note = " ".join(args[2:]) if len(args) > 2 else ""
             entry = self.store.create_license(plan, custom_days=custom_days, note=note)
-            self._send(chat_id, f"Created: {entry['key']} | plan={entry['plan']} | exp={entry['expiry']}")
+            self._send(chat_id, self._format_license(entry), buttons=[[{"text": "Add note", "callback_data": f"addnote:{entry['key']}"}, {"text": "Main menu", "callback_data": "menu"}]])
         elif cmd == "/renewkey":
             if len(args) < 2:
                 self._send(chat_id, "Usage: /renewkey <key> <plan> [days]")
                 return
             key, plan = args[0], args[1]; custom_days = int(args[2]) if len(args) > 2 and args[2].isdigit() else None
             entry, msg = self.store.renew_license(key, plan, custom_days)
-            self._send(chat_id, msg if not entry else f"Renewed {key} -> {entry['plan']} exp {entry['expiry']}")
+            self._send(chat_id, msg if not entry else f"Renewed <code>{escape(key)}</code> -> {escape(entry['plan'])} exp <code>{escape(entry['expiry'])}</code>", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
         elif cmd == "/disablekey":
             if not args:
                 self._send(chat_id, "Usage: /disablekey <key>")
                 return
             entry, msg = self.store.disable_license(args[0])
-            self._send(chat_id, msg if not entry else f"Disabled {args[0]}")
+            self._send(chat_id, msg if not entry else f"Disabled <code>{escape(args[0])}</code>", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
         elif cmd == "/keyinfo":
             if not args:
                 self._send(chat_id, "Usage: /keyinfo <key>")
@@ -268,20 +494,28 @@ class TelegramAdminBot:
             if not entry:
                 self._send(chat_id, "Not found")
                 return
-            devices = ", ".join(entry.get("devices") or []) or "Unbound"
-            self._send(chat_id, f"Key: {entry['key']}\nPlan: {entry['plan']}\nStatus: {entry['status']}\nStart: {entry.get('start')}\nExpiry: {entry.get('expiry')}\nDevices: {devices}\nNote: {entry.get('note','')}")
+            self._send(chat_id, self._format_license(entry), buttons=[[{"text": "Add note", "callback_data": f"addnote:{entry['key']}"}, {"text": "Main menu", "callback_data": "menu"}]])
         elif cmd == "/listkeys":
             status = args[0] if args else None
-            items = self.store.list_keys(status=status)
-            if not items:
-                self._send(chat_id, "No keys.")
-                return
-            lines = [f"{i['key']} | {i['plan']} | {i['status']} | exp {i.get('expiry')}" for i in items[:30]]
-            self._send(chat_id, "\n".join(lines))
+            self._send_list(chat_id, status=status)
         elif cmd == "/maintenance":
-            self._send(chat_id, "Maintenance toggle not implemented in this minimal bot.")
+            self._send(chat_id, "Maintenance toggle not implemented in this bot.", buttons=[[{"text": "Main menu", "callback_data": "menu"}]])
         else:
-            self._send(chat_id, "Commands: /newkey /renewkey /disablekey /keyinfo /listkeys")
+            self._send_help(chat_id)
+
+    def _send_help(self, chat_id):
+        text = (
+            "<b>License admin controls</b>\n"
+            "Buttons: use /start to open the menu for point-and-click actions.\n\n"
+            "Slash commands:\n"
+            "/newkey <plan> [days] [note]\n"
+            "/renewkey <key> <plan> [days]\n"
+            "/disablekey <key>\n"
+            "/keyinfo <key>\n"
+            "/listkeys [status]\n\n"
+            "Plans: 1d, 1w, 1m, 3m, 6m, 1y, life, custom (with days)."
+        )
+        self._send(chat_id, text, buttons=[[{"text": "Open menu", "callback_data": "menu"}]])
 
 # ----------------- HTTP API -----------------
 class LicenseAPIServer:
